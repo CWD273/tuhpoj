@@ -97,7 +97,7 @@ export default {
 
     try {
       const upstreamResponse = await fetch(targetUrl.toString(), init);
-      return buildProxiedResponse(upstreamResponse, request);
+      return buildProxiedResponse(upstreamResponse, request, targetUrl, requestUrl.origin);
     } catch (err) {
       return jsonResponse(
         { error: "Failed to fetch target URL.", detail: String(err) },
@@ -109,7 +109,7 @@ export default {
 
 // ---- Helpers ---------------------------------------------------------------
 
-function buildProxiedResponse(upstreamResponse, originalRequest) {
+function buildProxiedResponse(upstreamResponse, originalRequest, targetUrl, proxyOrigin) {
   const headers = new Headers(upstreamResponse.headers);
   STRIP_RESPONSE_HEADERS.forEach((h) => headers.delete(h));
 
@@ -118,11 +118,136 @@ function buildProxiedResponse(upstreamResponse, originalRequest) {
   headers.set("Access-Control-Allow-Origin", origin || "*");
   headers.set("Vary", "Origin");
 
-  return new Response(upstreamResponse.body, {
+  const contentType = headers.get("content-type") || "";
+
+  // Only HTML responses get link/resource rewriting. Other content types
+  // (images, fonts, JSON, plain CSS, etc.) are streamed through as-is.
+  if (!contentType.includes("text/html")) {
+    return new Response(upstreamResponse.body, {
+      status: upstreamResponse.status,
+      statusText: upstreamResponse.statusText,
+      headers,
+    });
+  }
+
+  // Rewriting removes the original Content-Length; let the runtime recompute
+  // it (chunked transfer) rather than send a stale value.
+  headers.delete("content-length");
+
+  const rewriter = new HTMLRewriter()
+    .on("a", new AttributeRewriter("href", targetUrl, proxyOrigin))
+    .on("link", new AttributeRewriter("href", targetUrl, proxyOrigin))
+    .on("img", new AttributeRewriter("src", targetUrl, proxyOrigin))
+    .on("img", new SrcsetRewriter("srcset", targetUrl, proxyOrigin))
+    .on("script", new AttributeRewriter("src", targetUrl, proxyOrigin))
+    .on("source", new AttributeRewriter("src", targetUrl, proxyOrigin))
+    .on("source", new SrcsetRewriter("srcset", targetUrl, proxyOrigin))
+    .on("form", new AttributeRewriter("action", targetUrl, proxyOrigin))
+    .on("iframe", new AttributeRewriter("src", targetUrl, proxyOrigin))
+    .on("video", new AttributeRewriter("src", targetUrl, proxyOrigin))
+    .on("video", new AttributeRewriter("poster", targetUrl, proxyOrigin))
+    .on("audio", new AttributeRewriter("src", targetUrl, proxyOrigin))
+    .on('meta[http-equiv="refresh" i]', new MetaRefreshRewriter(targetUrl, proxyOrigin))
+    .on("base", new BaseTagRemover());
+
+  const transformed = rewriter.transform(
+    new Response(upstreamResponse.body, { status: upstreamResponse.status })
+  );
+
+  return new Response(transformed.body, {
     status: upstreamResponse.status,
     statusText: upstreamResponse.statusText,
     headers,
   });
+}
+
+// Rewrites a single URL-bearing attribute (href/src/action/poster) so it
+// routes back through the proxy with the resolved absolute URL as ?url=.
+class AttributeRewriter {
+  constructor(attributeName, targetUrl, proxyOrigin) {
+    this.attributeName = attributeName;
+    this.targetUrl = targetUrl;
+    this.proxyOrigin = proxyOrigin;
+  }
+
+  element(element) {
+    const value = element.getAttribute(this.attributeName);
+    if (!value) return;
+
+    // Leave alone: same-page anchors, javascript:, mailto:, tel:, data: URIs
+    if (/^(#|javascript:|mailto:|tel:|data:)/i.test(value.trim())) return;
+
+    const rewritten = rewriteUrl(value, this.targetUrl, this.proxyOrigin);
+    if (rewritten) element.setAttribute(this.attributeName, rewritten);
+  }
+}
+
+// srcset is a comma-separated list of "url descriptor" pairs; each URL needs
+// rewriting independently.
+class SrcsetRewriter {
+  constructor(attributeName, targetUrl, proxyOrigin) {
+    this.attributeName = attributeName;
+    this.targetUrl = targetUrl;
+    this.proxyOrigin = proxyOrigin;
+  }
+
+  element(element) {
+    const value = element.getAttribute(this.attributeName);
+    if (!value) return;
+
+    const rewritten = value
+      .split(",")
+      .map((part) => {
+        const trimmed = part.trim();
+        if (!trimmed) return trimmed;
+        const [url, descriptor] = trimmed.split(/\s+/, 2);
+        const newUrl = rewriteUrl(url, this.targetUrl, this.proxyOrigin) || url;
+        return descriptor ? `${newUrl} ${descriptor}` : newUrl;
+      })
+      .join(", ");
+
+    element.setAttribute(this.attributeName, rewritten);
+  }
+}
+
+// <meta http-equiv="refresh" content="5;url=/next.html">
+class MetaRefreshRewriter {
+  constructor(targetUrl, proxyOrigin) {
+    this.targetUrl = targetUrl;
+    this.proxyOrigin = proxyOrigin;
+  }
+
+  element(element) {
+    const content = element.getAttribute("content");
+    if (!content) return;
+
+    const match = content.match(/^(\s*\d+\s*;\s*url\s*=\s*)(.+)$/i);
+    if (!match) return;
+
+    const rewritten = rewriteUrl(match[2].trim(), this.targetUrl, this.proxyOrigin);
+    if (rewritten) element.setAttribute("content", `${match[1]}${rewritten}`);
+  }
+}
+
+// Drop any <base> tag from the source page — it would otherwise change how
+// the browser resolves any URL we didn't rewrite (inline styles, JS-added
+// nodes, etc.) and conflict with our rewriting.
+class BaseTagRemover {
+  element(element) {
+    element.remove();
+  }
+}
+
+// Resolves rawUrl against the original target page, then wraps it as a
+// proxy URL: {proxyOrigin}/?url=<encoded absolute url>
+function rewriteUrl(rawUrl, targetUrl, proxyOrigin) {
+  try {
+    const absolute = new URL(rawUrl, targetUrl);
+    if (!["http:", "https:"].includes(absolute.protocol)) return null;
+    return `${proxyOrigin}/?url=${encodeURIComponent(absolute.toString())}`;
+  } catch (err) {
+    return null;
+  }
 }
 
 function handleOptions(request) {
