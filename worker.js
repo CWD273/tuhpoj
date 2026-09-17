@@ -311,6 +311,95 @@ function buildRuntimeShim(targetUrl, proxyOrigin) {
       return originalSendBeacon(rewrite(url), data);
     };
   }
+
+  // --- Handle links/resources the page creates or edits AFTER load ---
+  // Heavily client-rendered sites (React/Vue apps, infinite-scroll feeds,
+  // etc.) build most of their DOM with JavaScript rather than in the HTML
+  // that was originally fetched, so the server-side HTMLRewriter pass never
+  // sees those elements. We intercept them here instead.
+
+  var URL_ATTRS = { href: 1, src: 1, action: 1, poster: 1 };
+
+  // 1) Anything set via el.setAttribute("href", ...) etc.
+  var originalSetAttribute = Element.prototype.setAttribute;
+  Element.prototype.setAttribute = function(name, value) {
+    if (URL_ATTRS[String(name).toLowerCase()] && typeof value === "string") {
+      value = rewrite(value);
+    }
+    return originalSetAttribute.call(this, name, value);
+  };
+
+  // 2) Anything set via the JS property directly (el.href = ..., img.src = ...)
+  function patchProperty(proto, prop) {
+    if (!proto) return;
+    var descriptor = Object.getOwnPropertyDescriptor(proto, prop);
+    if (!descriptor || !descriptor.set) return;
+    Object.defineProperty(proto, prop, {
+      configurable: true,
+      enumerable: descriptor.enumerable,
+      get: descriptor.get,
+      set: function(value) {
+        descriptor.set.call(this, rewrite(value));
+      },
+    });
+  }
+  [
+    [window.HTMLAnchorElement, "href"],
+    [window.HTMLAreaElement, "href"],
+    [window.HTMLImageElement, "src"],
+    [window.HTMLScriptElement, "src"],
+    [window.HTMLIFrameElement, "src"],
+    [window.HTMLSourceElement, "src"],
+    [window.HTMLMediaElement, "src"],
+    [window.HTMLFormElement, "action"],
+  ].forEach(function(pair) {
+    try { patchProperty(pair[0] && pair[0].prototype, pair[1]); } catch (e) {}
+  });
+
+  // 3) Anything inserted wholesale via innerHTML/insertAdjacentHTML, which
+  //    bypasses both setAttribute and property setters above (the browser's
+  //    HTML parser sets attributes directly). A MutationObserver catches
+  //    these after the fact and re-applies our rewriting.
+  function fixElement(el) {
+    if (!el.hasAttribute) return;
+    Object.keys(URL_ATTRS).forEach(function(attr) {
+      if (!el.hasAttribute(attr)) return;
+      var val = el.getAttribute(attr);
+      if (!val || val.indexOf(PROXY_ORIGIN) === 0) return;
+      if (/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(val)) return;
+      el.setAttribute(attr, val); // routed through the patched setAttribute above
+    });
+  }
+
+  var observer = new MutationObserver(function(mutations) {
+    mutations.forEach(function(m) {
+      if (m.type === "attributes") {
+        fixElement(m.target);
+      } else if (m.type === "childList") {
+        m.addedNodes.forEach(function(node) {
+          if (node.nodeType !== 1) return;
+          fixElement(node);
+          if (node.querySelectorAll) {
+            node.querySelectorAll("[href],[src],[action]").forEach(fixElement);
+          }
+        });
+      }
+    });
+  });
+
+  function startObserving() {
+    observer.observe(document.documentElement, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["href", "src", "action", "poster"],
+    });
+  }
+  if (document.documentElement) {
+    startObserving();
+  } else {
+    document.addEventListener("DOMContentLoaded", startObserving);
+  }
 })();</script>`;
 }
 
