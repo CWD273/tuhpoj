@@ -1,3 +1,6 @@
 name = "url-proxy-worker"
 main = "worker.js"
 compatibility_date = "2024-09-01"
+routes = [
+  { pattern = "://tuhpoj.my.to*", zone_name = "tuhpoj" }
+]
