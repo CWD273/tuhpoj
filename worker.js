@@ -148,7 +148,8 @@ function buildProxiedResponse(upstreamResponse, originalRequest, targetUrl, prox
     .on("video", new AttributeRewriter("poster", targetUrl, proxyOrigin))
     .on("audio", new AttributeRewriter("src", targetUrl, proxyOrigin))
     .on('meta[http-equiv="refresh" i]', new MetaRefreshRewriter(targetUrl, proxyOrigin))
-    .on("base", new BaseTagRemover());
+    .on("base", new BaseTagRemover())
+    .on("head", new RuntimeShimInjector(targetUrl, proxyOrigin));
 
   const transformed = rewriter.transform(
     new Response(upstreamResponse.body, { status: upstreamResponse.status })
@@ -236,6 +237,81 @@ class BaseTagRemover {
   element(element) {
     element.remove();
   }
+}
+
+// Injects a small runtime shim as the first child of <head>, so it runs
+// before any of the page's own scripts. The shim patches window.fetch and
+// XMLHttpRequest.prototype.open so that any URL those calls target — whether
+// relative (e.g. fetch("/api/data")) or absolute on the original target
+// domain (e.g. fetch("https://example.com/api/data")) — gets rewritten to
+// go back through the proxy first, avoiding both broken relative paths and
+// CORS failures from calling the target origin directly.
+class RuntimeShimInjector {
+  constructor(targetUrl, proxyOrigin) {
+    this.targetUrl = targetUrl;
+    this.proxyOrigin = proxyOrigin;
+  }
+
+  element(element) {
+    const script = buildRuntimeShim(this.targetUrl, this.proxyOrigin);
+    element.prepend(script, { html: true });
+  }
+}
+
+function buildRuntimeShim(targetUrl, proxyOrigin) {
+  // JSON.stringify safely escapes these for embedding in a <script> tag.
+  const targetBaseJson = JSON.stringify(targetUrl.toString());
+  const proxyOriginJson = JSON.stringify(proxyOrigin);
+
+  return `<script>(function() {
+  var PROXY_ORIGIN = ${proxyOriginJson};
+  var TARGET_BASE = ${targetBaseJson};
+
+  function rewrite(url) {
+    try {
+      if (typeof url !== "string" || url === "") return url;
+      if (/^(data:|blob:|javascript:|mailto:|tel:|#)/i.test(url)) return url;
+      if (url.indexOf(PROXY_ORIGIN) === 0) return url; // already proxied
+      var absolute = new URL(url, TARGET_BASE);
+      if (absolute.protocol !== "http:" && absolute.protocol !== "https:") return url;
+      return PROXY_ORIGIN + "/?url=" + encodeURIComponent(absolute.href);
+    } catch (e) {
+      return url;
+    }
+  }
+
+  // Patch fetch()
+  var originalFetch = window.fetch;
+  if (originalFetch) {
+    window.fetch = function(input, init) {
+      try {
+        if (typeof input === "string") {
+          input = rewrite(input);
+        } else if (input && typeof input === "object" && "url" in input) {
+          input = new Request(rewrite(input.url), input);
+        }
+      } catch (e) {}
+      return originalFetch.call(this, input, init);
+    };
+  }
+
+  // Patch XMLHttpRequest
+  var originalOpen = XMLHttpRequest.prototype.open;
+  XMLHttpRequest.prototype.open = function(method, url) {
+    var rewritten = rewrite(url);
+    var args = Array.prototype.slice.call(arguments);
+    args[1] = rewritten;
+    return originalOpen.apply(this, args);
+  };
+
+  // Patch navigator.sendBeacon, used by some analytics/telemetry calls
+  if (navigator.sendBeacon) {
+    var originalSendBeacon = navigator.sendBeacon.bind(navigator);
+    navigator.sendBeacon = function(url, data) {
+      return originalSendBeacon(rewrite(url), data);
+    };
+  }
+})();</script>`;
 }
 
 // Resolves rawUrl against the original target page, then wraps it as a
